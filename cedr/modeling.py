@@ -35,8 +35,9 @@ class BertRanker(torch.nn.Module):
         toks = [self.tokenizer.vocab[t] for t in toks]
         return toks
 
-    def encode_bert(self, query_tok, query_mask, doc_tok, doc_mask):
+    def encode_bert_two_text(self, query_tok, query_mask, doc_tok, doc_mask):
         BATCH, QLEN = query_tok.shape
+        
         DIFF = 3 # = [CLS] and 2x[SEP]
         maxlen = self.bert.config.max_position_embeddings
         MAX_DOC_TOK_LEN = maxlen - QLEN - DIFF
@@ -78,7 +79,86 @@ class BertRanker(torch.nn.Module):
 
         return cls_results, query_results, doc_results
 
+    def encode_bert_single_text(self, text_tok, text_mask):
+        BATCH, TLEN = text_tok.shape
+        
+        DIFF = 1 # = [CLS] 
+        maxlen = self.bert.config.max_position_embeddings
+        MAX_DOC_TOK_LEN = maxlen - DIFF
 
+        text_toks, sbcount = modeling_util.subbatch(text_tok, MAX_DOC_TOK_LEN)
+        text_mask, _ = modeling_util.subbatch(text_mask, MAX_DOC_TOK_LEN)
+
+        CLSS = torch.full_like(text_toks[:, :1], self.tokenizer.vocab['[CLS]'])
+        ONES = torch.ones_like(text_mask[:, :1])
+        NILS = torch.zeros_like(text_mask[:, :1])
+
+        # build BERT input sequences
+        toks = torch.cat([CLSS, text_toks], dim=1)
+        mask = torch.cat([ONES, text_mask], dim=1)
+        segment_ids = torch.cat([NILS] * (1 + text_toks.shape[1]), dim=1)
+        toks[toks == -1] = 0 # remove padding (will be masked anyway)
+
+        # execute BERT model
+        result = self.bert(toks, segment_ids.long(), mask)
+
+        # extract relevant subsequences for query and doc
+        text_results = [r[:, 1:] for r in result]
+        text_results = [modeling_util.un_subbatch(r, text_tok, MAX_DOC_TOK_LEN) for r in text_results]
+
+        # build CLS representation
+        cls_results = []
+        for layer in result:
+            cls_output = layer[:, 0]
+            cls_result = []
+            for i in range(cls_output.shape[0] // BATCH):
+                cls_result.append(cls_output[i*BATCH:(i+1)*BATCH])
+            cls_result = torch.stack(cls_result, dim=2).mean(dim=2)
+            cls_results.append(cls_result)
+
+        return cls_results, text_results
+
+
+class CedrSepKnrmRanker(BertRanker):
+    def __init__(self):
+        super().__init__()
+        MUS = [-0.9, -0.7, -0.5, -0.3, -0.1, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+        SIGMAS = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.001]
+        self.bert_ranker = VanillaBertRankerSingle()
+        self.simmat = modeling_util.SimmatModule()
+        self.kernels = modeling_util.KNRMRbfKernelBank(MUS, SIGMAS)
+        #v1
+        #self.combine = torch.nn.Linear(self.kernels.count() * self.CHANNELS + 2 * self.BERT_SIZE, 1)
+        #v2
+        self.combine = torch.nn.Linear(self.kernels.count() * self.CHANNELS + 1, 1)
+        
+    def forward(self, query_tok, query_mask, doc_tok, doc_mask):
+        q_cls_reps, query_reps = self.encode_bert_single_text(query_tok, query_mask)
+        d_cls_reps, doc_reps = self.encode_bert_single_text(doc_tok, doc_mask)
+        
+        simmat = self.simmat(query_reps, doc_reps, query_tok, doc_tok)
+        kernels = self.kernels(simmat)
+        BATCH, KERNELS, VIEWS, QLEN, DLEN = kernels.shape
+        kernels = kernels.reshape(BATCH, KERNELS * VIEWS, QLEN, DLEN)
+        simmat = simmat.reshape(BATCH, 1, VIEWS, QLEN, DLEN) \
+                       .expand(BATCH, KERNELS, VIEWS, QLEN, DLEN) \
+                       .reshape(BATCH, KERNELS * VIEWS, QLEN, DLEN)
+        result = kernels.sum(dim=3) # sum over document
+        mask = (simmat.sum(dim=3) != 0.) # which query terms are not padding?
+       
+        result = torch.where(mask, (result + 1e-6).log(), mask.float())
+        result = result.sum(dim=2) # sum over query terms
+        
+        # v1, cls1(768) + cls2 (768) + softtf
+        #result = torch.cat([result, q_cls_reps[-1], d_cls_reps[-1]], dim=1)
+        # v2, sim_cls + softtf
+        clssim = (q_cls_reps[-1] * d_cls_reps[-1]).sum(-1).unsqueeze(1)
+        result = torch.cat([result, clssim], dim=1)
+        
+        scores = self.combine(result) # linear combination over kernels
+        return scores
+
+    
 class VanillaBertRanker(BertRanker):
     def __init__(self):
         super().__init__()
@@ -86,7 +166,17 @@ class VanillaBertRanker(BertRanker):
         self.cls = torch.nn.Linear(self.BERT_SIZE, 1)
 
     def forward(self, query_tok, query_mask, doc_tok, doc_mask):
-        cls_reps, _, _ = self.encode_bert(query_tok, query_mask, doc_tok, doc_mask)
+        cls_reps, _, _ = self.encode_bert_two_text(query_tok, query_mask, doc_tok, doc_mask)
+        return self.cls(self.dropout(cls_reps[-1]))
+
+class VanillaBertRankerSingle(BertRanker):
+    def __init__(self):
+        super().__init__()
+        self.dropout = torch.nn.Dropout(0.1)
+        self.cls = torch.nn.Linear(self.BERT_SIZE, 1)
+
+    def forward(self, text_tok, text_mask):
+        cls_reps, _ = self.encode_bert_single_text(text_tok, text_mask)
         return self.cls(self.dropout(cls_reps[-1]))
 
 
@@ -110,7 +200,7 @@ class CedrPacrrRanker(BertRanker):
         self.linear3 = torch.nn.Linear(32, 1)
 
     def forward(self, query_tok, query_mask, doc_tok, doc_mask):
-        cls_reps, query_reps, doc_reps = self.encode_bert(query_tok, query_mask, doc_tok, doc_mask)
+        cls_reps, query_reps, doc_reps = self.encode_bert_two_text(query_tok, query_mask, doc_tok, doc_mask)
         simmat = self.simmat(query_reps, doc_reps, query_tok, doc_tok)
         scores = [ng(simmat) for ng in self.ngrams]
         scores = torch.cat(scores, dim=2)
@@ -133,7 +223,7 @@ class CedrKnrmRanker(BertRanker):
         self.combine = torch.nn.Linear(self.kernels.count() * self.CHANNELS + self.BERT_SIZE, 1)
 
     def forward(self, query_tok, query_mask, doc_tok, doc_mask):
-        cls_reps, query_reps, doc_reps = self.encode_bert(query_tok, query_mask, doc_tok, doc_mask)
+        cls_reps, query_reps, doc_reps = self.encode_bert_two_text(query_tok, query_mask, doc_tok, doc_mask)
         simmat = self.simmat(query_reps, doc_reps, query_tok, doc_tok)
         kernels = self.kernels(simmat)
         BATCH, KERNELS, VIEWS, QLEN, DLEN = kernels.shape
@@ -162,7 +252,7 @@ class CedrDrmmRanker(BertRanker):
         self.hidden_2 = torch.nn.Linear(HIDDEN, 1)
 
     def forward(self, query_tok, query_mask, doc_tok, doc_mask):
-        cls_reps, query_reps, doc_reps = self.encode_bert(query_tok, query_mask, doc_tok, doc_mask)
+        cls_reps, query_reps, doc_reps = self.encode_bert_two_text(query_tok, query_mask, doc_tok, doc_mask)
         simmat = self.simmat(query_reps, doc_reps, query_tok, doc_tok)
         histogram = self.histogram(simmat, doc_tok, query_tok)
         BATCH, CHANNELS, QLEN, BINS = histogram.shape
